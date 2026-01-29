@@ -3,13 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/JohannesKaufmann/html-to-markdown/v2"
-	"github.com/google/uuid"
-	"github.com/kydenul/markdown-chunker"
-	"github.com/qdrant/go-client/qdrant"
-	"github.com/sashabaranov/go-openai"
-	"gorm.io/driver/mysql"
-	"gorm.io/gorm"
 	"io"
 	"log"
 	"os"
@@ -18,8 +11,19 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/JohannesKaufmann/html-to-markdown/v2"
+	"github.com/google/uuid"
+	"github.com/kydenul/markdown-chunker"
+	"github.com/pgvector/pgvector-go"
+	"github.com/sashabaranov/go-openai"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
+const vectorSize = 1536
+
+// IvankaContent 历史数据表 ivanka_content（与 main 分支 article_entries 结构对齐）
 type ArticleEntries struct {
 	Id           int64
 	Title        string
@@ -28,27 +32,33 @@ type ArticleEntries struct {
 	CreatedAt    time.Time
 }
 
-func (e *ArticleEntries) GetPayload(chunkIndex int, input string) map[string]any {
-	return map[string]any{
-		"textToIndex": strings.ToValidUTF8(input, ""),
-		"title":       e.Title,
-		"created_at":  e.CreatedAt.Unix(),
-		"id":          e.Id,
-		"chunk_index": chunkIndex,
-		"summary":     e.ContentShort,
-	}
+// VectorStore 向量表 vector_stores，存储 chunk 及嵌入向量
+type VectorStore struct {
+	Id          string          `gorm:"type:uuid;primaryKey"`
+	Embedding   pgvector.Vector `gorm:"type:vector(1536);not null"`
+	TextToIndex string          `gorm:"column:text_to_index;type:text"`
+	Title       string          `gorm:"type:text"`
+	CreatedAt   int64           `gorm:"column:created_at;type:bigint"`
+	SourceId    int64           `gorm:"column:source_id;type:bigint"`
+	ChunkIndex  int             `gorm:"column:chunk_index;type:int"`
+	Summary     string          `gorm:"type:text"`
+}
+
+func (VectorStore) TableName() string { return "vector_stores" }
+
+func (e *ArticleEntries) GetPayload(chunkIndex int, input string) (textToIndex, title, summary string, createdAt int64, sourceId int64, chunkIdx int) {
+	return strings.ToValidUTF8(input, ""), e.Title, e.ContentShort, e.CreatedAt.Unix(), e.Id, chunkIndex
 }
 
 func main() {
 	ctx := context.Background()
 	runtime.GOMAXPROCS(runtime.NumCPU() / 2)
 
-	var (
-		collectionName = os.Getenv("COLLECTION_NAME")
-		apiKey         = os.Getenv("OPENROUTER_API_KEY")
-		bashUrl        = os.Getenv("OPENROUTER_API_BASE_URL")
-		VectorSize     = 1536
-	)
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	baseURL := os.Getenv("OPENROUTER_API_BASE_URL")
+	if apiKey == "" || baseURL == "" {
+		log.Fatalln("需要环境变量: OPENROUTER_API_KEY, OPENROUTER_API_BASE_URL")
+	}
 
 	path, _ := filepath.Abs("offset.txt")
 	fmt.Println("offset file path =", path)
@@ -57,69 +67,32 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-
-	lastID := getOffsetFromFile(f) // 获取断点位置
+	lastID := getOffsetFromFile(f)
 	defer func() {
 		saveOffsetToFile(f, lastID)
 		f.Close()
-	}() // 实时记录断点
-	// 构建 DSN 连接字符串
-	dsn := fmt.Sprintf("root:rootpassword@tcp(localhost:3306)/ivanka_content?charset=utf8mb4&parseTime=True")
-	// 初始化 MySQL 连接
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	}()
+
+	dsn := os.Getenv("PG_DSN")
+	if dsn == "" {
+		dsn = "host=localhost user=postgres password=postgres dbname=vectors_db port=5432 sslmode=disable TimeZone=Asia/Shanghai"
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		panic(err)
 	}
 
+	// 确保 pgvector 扩展并建表
+	if err := db.Exec("CREATE EXTENSION IF NOT EXISTS vector").Error; err != nil {
+		panic(fmt.Errorf("创建 pgvector 扩展失败: %w", err))
+	}
+	if err := db.AutoMigrate(&VectorStore{}); err != nil {
+		panic(fmt.Errorf("迁移 vector_stores 表失败: %w", err))
+	}
+
 	conf := openai.DefaultConfig(apiKey)
-	conf.BaseURL = bashUrl
+	conf.BaseURL = baseURL
 	client := openai.NewClientWithConfig(conf)
-
-	// 初始化 Qdrant 连接
-	qdrantClient, err := qdrant.NewClient(&qdrant.Config{
-		Host: "localhost",
-		Port: 6334,
-	})
-	if err != nil {
-		log.Fatalln("qdrant client init failed, err ", err)
-	}
-	defer qdrantClient.Close()
-
-	cols, err := qdrantClient.ListCollections(ctx)
-	if err != nil {
-		log.Fatalln(err.Error())
-	}
-
-	colExist := false
-	for _, col := range cols {
-		if collectionName == col {
-			colExist = true
-			break
-		}
-	}
-
-	if !colExist {
-		// 3. 创建集合
-
-		err = qdrantClient.CreateCollection(ctx, &qdrant.CreateCollection{
-			CollectionName: collectionName,
-			VectorsConfig: qdrant.NewVectorsConfig(&qdrant.VectorParams{
-				Size:     uint64(VectorSize),
-				Distance: qdrant.Distance_Cosine, // 余弦相似度
-			}),
-		})
-
-		if err != nil {
-			log.Fatalln("create collection failed, err ", err)
-		}
-		// 4. 创建 Payload 索引 (为了高性能过滤)
-		// Qdrant 的 Go SDK 稍微有些底层，需要操作 PointsClient
-		createIndex(ctx, qdrantClient, collectionName, "created_at", qdrant.FieldType_FieldTypeInteger)
-		createIndex(ctx, qdrantClient, collectionName, "summary", qdrant.FieldType_FieldTypeText)
-		createIndex(ctx, qdrantClient, collectionName, "textToIndex", qdrant.FieldType_FieldTypeText)
-		createIndex(ctx, qdrantClient, collectionName, "title", qdrant.FieldType_FieldTypeText)
-		createIndex(ctx, qdrantClient, collectionName, "id", qdrant.FieldType_FieldTypeInteger)
-	}
 
 	for {
 		var rows []*ArticleEntries
@@ -127,66 +100,57 @@ func main() {
 			Where("id > ?", lastID).
 			Order("id asc").
 			Limit(100).Find(&rows).Error; err != nil {
-			break
+			panic(fmt.Errorf("查询 ivanka_content 失败: %w", err))
 		}
-
 		if len(rows) == 0 {
 			break
 		}
 
 		for _, row := range rows {
-			md, err := getInput(row)
+			md, err := getInputPG(row)
 			if err != nil {
-				panic(fmt.Errorf("failed to parse input: %w", err))
+				panic(fmt.Errorf("解析内容失败: %w", err))
 			}
-			// chunk
 			chunks, err := chunk(md)
 			if err != nil {
-				panic(fmt.Errorf("failed to chunk input: %w", err))
+				panic(fmt.Errorf("chunk 失败: %w", err))
 			}
 
 			var vectors [][]float32
 			for _, input := range chunks {
-				// 向量化
 				chatCompletion, err := client.CreateEmbeddings(ctx, openai.EmbeddingRequest{
-					Input:          convert(row, row.Title+"\n\n"+row.ContentShort+"\n\n"+input.Text),
+					Input:          convertPG(row, row.Title+"\n\n"+row.ContentShort+"\n\n"+input.Text),
 					Model:          "qwen/qwen3-embedding-8b",
 					EncodingFormat: openai.EmbeddingEncodingFormatFloat,
-					Dimensions:     VectorSize,
+					Dimensions:     vectorSize,
 				})
-
 				if err != nil {
 					panic(err)
 				}
 				if len(chatCompletion.Data) == 0 {
 					continue
 				}
-
-				vec := chatCompletion.Data[0].Embedding
-				vectors = append(vectors, vec)
+				vectors = append(vectors, chatCompletion.Data[0].Embedding)
 			}
 
-			// 保存到qdrant中
-			// todo 增减数据权限要求，比如存储可以访问此数据的用户角色
-			var points []*qdrant.PointStruct
 			for i, vec := range vectors {
-				point := &qdrant.PointStruct{
-					Id:      qdrant.NewID(uuid.New().String()),
-					Vectors: qdrant.NewVectors(vec...),
-					Payload: qdrant.NewValueMap(row.GetPayload(i, chunks[i].Text)),
+				if i >= len(chunks) {
+					break
 				}
-
-				points = append(points, point)
-			}
-
-			wait := true
-			_, err = qdrantClient.Upsert(ctx, &qdrant.UpsertPoints{
-				CollectionName: collectionName,
-				Points:         points,
-				Wait:           &wait,
-			})
-			if err != nil {
-				panic(fmt.Errorf("failed to upsert point: %w", err))
+				textToIndex, title, summary, createdAt, sourceId, chunkIdx := row.GetPayload(i, chunks[i].Text)
+				vs := &VectorStore{
+					Id:          uuid.New().String(),
+					Embedding:   pgvector.NewVector(vec),
+					TextToIndex: textToIndex,
+					Title:       title,
+					CreatedAt:   createdAt,
+					SourceId:    sourceId,
+					ChunkIndex:  chunkIdx,
+					Summary:     summary,
+				}
+				if err := db.Create(vs).Error; err != nil {
+					panic(fmt.Errorf("写入 vector_stores 失败: %w", err))
+				}
 			}
 			lastID = row.Id
 			fmt.Println("upserted row id", lastID)
@@ -194,81 +158,43 @@ func main() {
 	}
 }
 
-func createIndex(ctx context.Context, client *qdrant.Client, collectionName, fieldName string, fieldType qdrant.FieldType) {
-	_, err := client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
-		CollectionName: collectionName,
-		FieldName:      fieldName,
-		FieldType:      &fieldType,
-	})
-	if err != nil {
-		// 忽略"索引已存在"的错误，简化逻辑
-		fmt.Printf("⚠️  创建索引 '%s' 时提示 (可能是已存在): %v\n", fieldName, err)
-	} else {
-		fmt.Printf("✅ 索引 '%s' 创建成功\n", fieldName)
-	}
-}
-
 func chunk(md string) ([]markdownchunker.Chunk, error) {
 	config := markdownchunker.DefaultConfig()
 	config.MaxChunkSize = 1000
 	chunker := markdownchunker.NewMarkdownChunkerWithConfig(config)
-	chunks, err := chunker.ChunkDocument([]byte(md))
-	if err != nil {
-		return nil, err
-	}
-
-	return chunks, nil
+	return chunker.ChunkDocument([]byte(md))
 }
 
-func convert(row *ArticleEntries, input string) string {
+func convertPG(row *ArticleEntries, input string) string {
 	prefix := "付鹏"
 	if strings.Contains(row.Title, prefix) ||
 		strings.Contains(row.ContentShort, prefix) ||
 		strings.Contains(input, prefix) {
 		prefix = ""
 	}
-
 	return fmt.Sprintf("%s\n\n%s\n\n%s", row.Title, row.ContentShort, input)
 }
 
-func getInput(row *ArticleEntries) (string, error) {
-	convertString, err := htmltomarkdown.ConvertString(row.Content)
-	if err != nil {
-		return "", err
-	}
-
-	return convertString, nil
+func getInputPG(row *ArticleEntries) (string, error) {
+	return htmltomarkdown.ConvertString(row.Content)
 }
 
 func saveOffsetToFile(f *os.File, id int64) {
-	_, err := f.WriteString(fmt.Sprintf("\n%s:%d", time.Now().Format(time.DateOnly), id))
-	if err != nil {
-		fmt.Println(err)
-	}
-
-	if err = f.Sync(); err != nil {
-		fmt.Println(err)
-	}
+	_, _ = f.WriteString(fmt.Sprintf("\n%s:%d", time.Now().Format(time.DateOnly), id))
+	_ = f.Sync()
 }
 
 func getOffsetFromFile(f *os.File) int64 {
-	// 重置文件指针到开头，否则多次读会读不到内容
 	f.Seek(0, 0)
 	all, err := io.ReadAll(f)
 	if err != nil {
 		panic(err)
 	}
-
-	content := string(all)
-	if len(strings.TrimSpace(content)) == 0 {
+	content := strings.TrimSpace(string(all))
+	if content == "" {
 		return 0
 	}
-
 	rows := strings.Split(content, "\n")
-	if len(rows) == 0 {
-		return 0
-	}
-	// 找到最后一个非空行
 	last := ""
 	for i := len(rows) - 1; i >= 0; i-- {
 		if strings.TrimSpace(rows[i]) != "" {
@@ -276,16 +202,13 @@ func getOffsetFromFile(f *os.File) int64 {
 			break
 		}
 	}
-
 	if last == "" {
 		return 0
 	}
-
 	tags := strings.Split(last, ":")
 	if len(tags) < 2 {
 		return 0
 	}
-
 	id, err := strconv.ParseInt(tags[1], 10, 64)
 	if err != nil {
 		return 0
